@@ -1,3 +1,4 @@
+```
 usage: sepinject.py [-h] [--te RULES.te] [--remove-te REMOVE.te] [--seapp SEAPP.txt] [--remove-seapp REMOVE_SEAPP.txt]
                     [--file-contexts FILE_CTX.txt] [--property-contexts PROP_CTX.txt] [--service-contexts SVC_CTX.txt]
                     [--hwservice-contexts HWSVC_CTX.txt] [--policy POLICY_FILE [POLICY_FILE ...]] [--system-selinux DIR]
@@ -90,3 +91,4 @@ Usage:
 
 The tool compiles a small C helper (sepatch_helper) against the system
 libsepol on first run and caches it at ~/.cache/sepinject/sepatch_helper.
+```
