@@ -63,11 +63,24 @@ RE_COMMENTED_ORIG_NA = re.compile(r"^\s*;;\s*\(neverallow\b")
 RE_COMMENTED_DUP_NA  = re.compile(r"^\s*;\(neverallow\s+sepinject_aux")
 RE_ACTIVE_AUX_NA     = re.compile(r"^\(neverallow\s+sepinject_aux")
 
+# mlsconstrain-rewrite counterparts.  A rewritten mlsconstrain leaves behind:
+#   ;; sepinject: commented (mlsconstrain rewritten below)   (RE_SEPINJECT_ANNOT)
+#   ;; (mlsconstrain (CLS (PERMS)) ORIG_EXPR)                 (RE_COMMENTED_ORIG_MLS)
+#   ;; sepinject: mls superseded ... / prior mlsaux: ...      (RE_SEPINJECT_ANNOT)
+#   ;; (mlsconstrain ... (eq t1 sepinject_mlsaux_*))          (RE_COMMENTED_ORIG_MLS)
+#   (mlsconstrain ... (or ORIG (eq t1 sepinject_mlsaux_*)))   (RE_ACTIVE_MLS_REWRITE)
+# The active line is distinguished from a STOCK mlsconstrain only by the
+# presence of a sepinject_mlsaux_ reference, so the regex requires it — we
+# must never relocate or strip an unmodified stock constraint.
+RE_COMMENTED_ORIG_MLS = re.compile(r"^\s*;;\s*\(mlsconstrain\b")
+RE_ACTIVE_MLS_REWRITE = re.compile(r"^\(mlsconstrain\b.*sepinject_mlsaux_")
+
 def is_sepinject_cruft(line: str) -> bool:
     return bool(
         RE_SEPINJECT_ANNOT.match(line)
         or RE_COMMENTED_ORIG_NA.match(line)
         or RE_COMMENTED_DUP_NA.match(line)
+        or RE_COMMENTED_ORIG_MLS.match(line)
     )
 
 def paren_balanced(s: str) -> bool:
@@ -156,21 +169,25 @@ class Stmt:
 
 # ---- region processing -----------------------------------------------------
 
-def process_above(above_lines, relocate):
-    """Return (kept_lines, relocated_neverallow_raws)."""
+def process_above(above_lines, relocate, relocate_mls=False):
+    """Return (kept_lines, relocated_neverallow_raws, relocated_mls_raws)."""
     kept = []
     relocated = []
+    relocated_mls = []
     for line in above_lines:
         if is_sepinject_cruft(line):
             continue
         if relocate and RE_ACTIVE_AUX_NA.match(line):
             relocated.append(norm(line))
             continue
+        if relocate_mls and RE_ACTIVE_MLS_REWRITE.match(line):
+            relocated_mls.append(norm(line))
+            continue
         kept.append(line)
-    return kept, relocated
+    return kept, relocated, relocated_mls
 
 
-def build_below(below_lines, relocated):
+def build_below(below_lines, relocated, relocated_mls=None):
     """Parse, categorize, and re-render the mods region. Returns list of
     output lines (no trailing newlines)."""
     stmts = [Stmt(l) for l in below_lines if is_active(l)]
@@ -201,15 +218,24 @@ def build_below(below_lines, relocated):
         cands = [d for d in domains if objtype.startswith(d + "_")]
         return max(cands, key=len) if cands else None
 
+    if relocated_mls is None:
+        relocated_mls = []
+
     domain_bucket = defaultdict(list)   
     global_bucket = []                  
     typeperms = []                      
     aux = OrderedDict()             
+    mlsaux = OrderedDict()          
 
     def aux_slot(name):
         if name not in aux:
             aux[name] = {"attr": None, "set": None}
         return aux[name]
+
+    def mlsaux_slot(name):
+        if name not in mlsaux:
+            mlsaux[name] = {"attr": None, "set": None}
+        return mlsaux[name]
 
     for s in stmts:
         if s.kw == "typepermissive":
@@ -218,6 +244,10 @@ def build_below(below_lines, relocated):
             aux_slot(s.subject)["attr"] = s
         elif s.kw == "typeattributeset" and s.attr and s.attr.startswith("sepinject_aux"):
             aux_slot(s.attr)["set"] = s
+        elif s.kw == "typeattribute" and s.subject and s.subject.startswith("sepinject_mlsaux_"):
+            mlsaux_slot(s.subject)["attr"] = s
+        elif s.kw == "typeattributeset" and s.attr and s.attr.startswith("sepinject_mlsaux_"):
+            mlsaux_slot(s.attr)["set"] = s
         elif s.kw == "genfscon":
             global_bucket.append(s)
         elif s.kw in ("allow", "dontaudit", "auditallow", "typetransition"):
@@ -372,6 +402,24 @@ def build_below(below_lines, relocated):
                 out.append(raw)
             out.append("")
 
+    if mlsaux:
+        hdr("MLSCONSTRAIN-EXEMPTION AUXILIARY ATTRIBUTES")
+        for name in sorted(mlsaux):
+            slot = mlsaux[name]
+            if slot["attr"] is None or slot["set"] is None:
+                raise AssertionError(
+                    f"mlsaux attribute {name} missing its "
+                    f"{'typeattribute' if slot['attr'] is None else 'typeattributeset'}")
+            out.append(slot["attr"].raw)
+            out.append(slot["set"].raw)
+        out.append("")
+
+    if relocated_mls:
+        hdr("REWRITTEN MLSCONSTRAINS (relocated from above BEGIN_MODS)")
+        for raw in relocated_mls:
+            out.append(raw)
+        out.append("")
+
     if typeperms:
         hdr("TYPEPERMISSIVE DOMAINS")
         for s in sorted(typeperms, key=lambda x: x.subject or x.raw):
@@ -384,8 +432,10 @@ def build_below(below_lines, relocated):
 # ---- validation ------------------------------------------------------------
 
 def validate(above_in, above_out, below_in, below_out_lines,
-             relocated, relocate):
+             relocated, relocate, relocated_mls=None, relocate_mls=False):
     errors = []
+    if relocated_mls is None:
+        relocated_mls = []
 
     def active_norms(lines):
         return Counter(norm(l) for l in lines if is_active(l))
@@ -397,23 +447,34 @@ def validate(above_in, above_out, below_in, below_out_lines,
         for l in above_out:
             if RE_ACTIVE_AUX_NA.match(l):
                 errors.append(f"relocated neverallow left above: {l!r}")
+    if relocate_mls:
+        for l in above_out:
+            if RE_ACTIVE_MLS_REWRITE.match(l):
+                errors.append(f"relocated mlsconstrain left above: {l!r}")
 
     ai = active_norms(above_in)
     ao = active_norms(above_out)
     rc = Counter(relocated)
-    if relocate:
-        if (ai - rc) != ao:
+    rc_mls = Counter(relocated_mls)
+    # Everything relocated out of the ABOVE region (neverallows and/or
+    # mlsconstrains) must be exactly the difference between above-in and
+    # above-out; nothing else active may change.
+    removed_from_above = (rc if relocate else Counter()) + \
+                         (rc_mls if relocate_mls else Counter())
+    if relocate or relocate_mls:
+        if (ai - removed_from_above) != ao:
             errors.append("ABOVE active multiset changed unexpectedly "
-                          "(after removing relocated neverallows)")
-        if rc - ai:
-            errors.append("relocated neverallows were not all present above")
+                          "(after removing relocated neverallows/mlsconstrains)")
+        if removed_from_above - ai:
+            errors.append("relocated statement(s) were not all present above")
     else:
         if ai != ao:
             errors.append("ABOVE active multiset changed")
 
     bi = active_norms(below_in)
     bo = active_norms(below_out_lines)
-    expected = bi + (rc if relocate else Counter())
+    expected = bi + (rc if relocate else Counter()) \
+                  + (rc_mls if relocate_mls else Counter())
     if bo != expected:
         missing = expected - bo
         extra = bo - expected
@@ -442,6 +503,10 @@ def main():
     ap.add_argument("--relocate-neverallows", action="store_true",
                     help="pull active rewritten neverallows from above the "
                          "marker down into the mods region")
+    ap.add_argument("--relocate-mlsconstrains", action="store_true",
+                    help="pull active rewritten mlsconstrains (those carrying "
+                         "a sepinject_mlsaux_ exemption) from above the marker "
+                         "down into the mods region")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and report, but write nothing")
     ap.add_argument("--force", action="store_true",
@@ -466,11 +531,13 @@ def main():
     marker = lines[mi]
     below_in = lines[mi + 1:]
 
-    above_out, relocated = process_above(above_in, args.relocate_neverallows)
-    below_out, stmts = build_below(below_in, relocated)
+    above_out, relocated, relocated_mls = process_above(
+        above_in, args.relocate_neverallows, args.relocate_mlsconstrains)
+    below_out, stmts = build_below(below_in, relocated, relocated_mls)
 
     errors = validate(above_in, above_out, below_in, below_out,
-                      relocated, args.relocate_neverallows)
+                      relocated, args.relocate_neverallows,
+                      relocated_mls, args.relocate_mlsconstrains)
     if errors:
         print("[FAILED] validation errors — nothing written:", file=sys.stderr)
         for e in errors:
@@ -488,6 +555,8 @@ def main():
           f"({len(above_in) - len(above_out)} sepinject comment lines stripped)")
     if args.relocate_neverallows:
         print(f"  relocated neverallows: {len(relocated)}")
+    if args.relocate_mlsconstrains:
+        print(f"  relocated mlsconstrains: {len(relocated_mls)}")
     print(f"  below: {len(below_in)} -> {len(below_out)} lines")
     print("  below active statement counts (preserved):")
     for k in sorted(kw_in):
