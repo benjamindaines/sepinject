@@ -1,15 +1,15 @@
-
 ```
-usage: sepinject8.py [-h] [--te RULES.te] [--remove-te REMOVE.te] [--seapp SEAPP.txt]
-                     [--remove-seapp REMOVE_SEAPP.txt] [--file-contexts FILE_CTX.txt]
-                     [--property-contexts PROP_CTX.txt] [--service-contexts SVC_CTX.txt]
-                     [--hwservice-contexts HWSVC_CTX.txt] [--policy POLICY_FILE [POLICY_FILE ...]]
-                     [--system-selinux DIR] [--vendor-selinux DIR] [--rom-root DIR] [--dry-run]
-                     [--dump-json OUT.json] [--skip-binary] [--skip-cil] [--skip-seapp] [--skip-file-contexts]
-                     [--skip-property-contexts] [--skip-service-contexts] [--skip-hwservice-contexts]
-                     [--skip-sha256] [--skip-neverallow-check] [--plat-cil-only] [--no-auto-coredomain]
-                     [--coredomain TYPE] [--vendor-attr-add ATTR=TYPE1,TYPE2] [--validate] [--validate-full]
-                     [--rebuild-neverallows] [--rebuild-mods-marker MARKER] [--yes]
+usage: SEPinject [-h] [--te RULES.te] [--remove-te REMOVE.te] [--seapp SEAPP.txt]
+                 [--remove-seapp REMOVE_SEAPP.txt] [--file-contexts FILE_CTX.txt]
+                 [--property-contexts PROP_CTX.txt] [--service-contexts SVC_CTX.txt]
+                 [--hwservice-contexts HWSVC_CTX.txt] [--policy POLICY_FILE [POLICY_FILE ...]]
+                 [--system-selinux DIR] [--vendor-selinux DIR] [--rom-root DIR] [--dry-run]
+                 [--dump-json OUT.json] [--skip-binary] [--skip-cil] [--skip-seapp] [--skip-file-contexts]
+                 [--skip-property-contexts] [--skip-service-contexts] [--skip-hwservice-contexts] [--skip-sha256]
+                 [--skip-neverallow-check] [--plat-cil-only] [--no-auto-coredomain] [--coredomain TYPE]
+                 [--vendor-attr-add ATTR=TYPE1,TYPE2] [--validate] [--validate-full] [--rebuild-neverallows]
+                 [--rebuild-mods-marker MARKER] [--yes] [--recreate-mlsconstrains] [--recreate-mls-domain DOMAIN]
+                 [--check-mlsconstrains]
 
 Inject SELinux policy rules from a .te file into Android ROM policy files.
 
@@ -100,8 +100,32 @@ options:
   --rebuild-mods-marker MARKER
                         Override the marker line used by --rebuild-neverallows to find the start of user mods
                         (default: '; ~~~:BEGIN_MODS:~~~')
-  --yes, --assume-yes   Auto-approve the interactive prompt issued by --rebuild-neverallows. Use with care — in
-                        recovery scenarios you may want to review each rewrite first.
+  --yes, --assume-yes   Auto-approve the interactive prompt issued by --rebuild-neverallows / --recreate-
+                        mlsconstrains (and the --check-mlsconstrains pre-flight). Use with care — in recovery
+                        scenarios you may want to review each rewrite first.
+  --recreate-mlsconstrains
+                        Recovery mode, the MLS analogue of --rebuild-neverallows: scan the same fixed set of CIL
+                        files under --rom-root (plat_sepolicy.cil, system_ext_sepolicy.cil, vendor_sepolicy.cil,
+                        plat_pub_versioned.cil — NOT a recursive glob), look for the marker line ';
+                        ~~~:BEGIN_MODS:~~~', extract every `(allow ...)` below it, and check those against the
+                        FULL set of mlsconstrains. A constraint that would (or could) DENY a mod allow at runtime
+                        is widened with an `(or ORIG (eq t1 sepinject_mlsaux_*))` exemption for the offending
+                        subject domain(s). Standalone — requires --rom-root, accepts --dry-run / --skip-sha256 /
+                        --plat-cil-only / --yes and the shared --rebuild-mods-marker. Backs up every targeted CIL
+                        into <rom-root>/sepinject_recreate_mlsconstrains_backup_<TS>/ before any write.
+  --recreate-mls-domain DOMAIN
+                        Like --recreate-mlsconstrains, but only widen constraints that block the single source
+                        domain DOMAIN — the mod allow rules are filtered to rule.src == DOMAIN before the scan.
+                        Use this to exempt one domain at a time instead of punching holes in every constraint for
+                        every mod subject at once. Same standalone requirements/flags as --recreate-
+                        mlsconstrains.
+  --check-mlsconstrains
+                        During a normal --te patch run, ALSO scan for mlsconstrain conflicts (constraints that
+                        would deny an injected allow at runtime) and offer to widen them, mirroring the
+                        neverallow pre-flight. This is OPT-IN (the neverallow pre-flight is opt-out) on purpose:
+                        unlike neverallow conflicts, mlsconstrain conflicts do NOT break a CIL recompile, so
+                        auto-relaxing MLS on every run would silently loosen policy. Enable it only when you
+                        specifically want MLS constraints considered.
 
 sepinject.py — Inject or remove SELinux policy rules from pre-compiled
 Android ROM binary policy files (sepolicy / precompiled_sepolicy) without
