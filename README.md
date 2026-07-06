@@ -1,9 +1,9 @@
 ### NOTE:
-It is recommended to run SEPcheck before making any changes, to make sure the .cil files in your ROM actually compile.  It's fairly likely that they won't.  If they don't, run SEPsani to clean them of duplicate entires across multiple partitions.  Run SEPcheck again after, it should pass at that point.. hopefully. 
+It is recommended to run SEPcheck before making any changes, to make sure the .cil files in your ROM actually compile.  It's fairly likely that they won't.  If they don't, run SEPsani to clean them of duplicate entries across multiple partitions.  Run SEPcheck again after, it should pass at that point.. hopefully. 
 
 This toolset has only been tested during the process of building the BenOS ROM, I assume it will work generally, let me know if it doesn't or feel free to fork and submit PRs with changes that make it work more universally.
 
-Good luck, have fun.  Make frequent backups. 
+Good luck, have fun.  Make frequent backups. Keeping working backups is the absolute best advice, but the advice at the bottom of the README is almost as good.  Be sure to read it ;)
 
 # SEPinject
 ```
@@ -301,7 +301,7 @@ Nothing fancy, just a bash script that calls secilc.  Installer script places it
 # SEPwalk
 Feed it your .te file and --rom-root and it will suggest additional rules you will need.  Not perfect, does help tho.  This is the major area that could use improvement. 
 
-Can be used as such: `$ SEPwalk --te your-te.te --rom-root path/to/rom/root >> your-te.te` suggested additional rule will be printed ready to be injected with SEPinject without any additional editing.
+Can be used as such: `$ SEPwalk --te your-te.te --rom-root path/to/rom/root >> your-te.te` suggested additional rule will be printed ready to be injected with SEPinject without any additional editing.  Run the above command a few times too, until it stops giving additional suggestions or beings repeating itself.  At that point, shove it into your policy and give the wheel a spin. 🤞 Check `dmesg` and `logcat` for avc denials.  If you're still getting denials after you've added the necessary allows, you're proably running into a `mlsconstrain` or `neverallow.` While `neverallow`s should be handled cleanly and automatically, one can still find themselves in the situation where it's best to go back to the original `neverallow`, delete the sepinject carve-outs, and run ``--rebuild-neverallows`, you may also find yourself in the position where the best thing to do is delete the entire sepolicy above your changes (you did save a copy of the post-`SEPsani` condition, yes?) and re-paste a known working, clean state, then run `--rebuild-neverallows`.  I've never had to start completely over, don't panic when you burn your policy :)
 ```
 usage: sepolwalker [-h] --te TE --rom-root ROM_ROOT [-o OUTPUT] [-v]
 
