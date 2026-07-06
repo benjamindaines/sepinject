@@ -300,6 +300,8 @@ Nothing fancy, just a bash script that calls secilc.  Installer script places it
 
 # SEPwalk
 Feed it your .te file and --rom-root and it will suggest additional rules you will need.  Not perfect, does help tho.  This is the major area that could use improvement. 
+
+Can be used as such: `$ SEPwalk --te your-te.te --rom-root path/to/rom/root >> your-te.te` suggested additional rule will be printed ready to be injected with SEPinject without any additional editing.
 ```
 usage: sepolwalker [-h] --te TE --rom-root ROM_ROOT [-o OUTPUT] [-v]
 
