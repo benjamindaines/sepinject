@@ -12,7 +12,7 @@ continue=${input^^}
 
 [[ $continue == "Y" ]] && { \
 
-	mkdir -p SEPinject SEPclean SEPsani
+	mkdir -p SEPinject SEPclean SEPsani SEPwalk
 	
 	cd ./SEPinject || exit 1
 	pyinstaller --onefile ../sepinject.py
@@ -26,10 +26,15 @@ continue=${input^^}
 	pyinstaller --onefile ../SEPsani.py
 	cd ..
 	
+	cd ./SEPwalk || exit 1
+	pyinstaller --onefile ../SEPwalk.py
+	cd ..
+
 	mkdir -p ~/.local/bin
 	cp SEPinject/dist/sepinject 	~/.local/bin/SEPinject
 	cp SEPclean/dist/clean_cil 	~/.local/bin/SEPclean
 	cp SEPsani/dist/SEPsani 	~/.local/bin/SEPsani
+	cp SEPwalk/dist/SEPwalk 	~/.local/bin/SEPwalk
 	cp sepcheck.sh 			~/.local/bin/SEPcheck && chmod +x ~/.local/bin/SEPcheck
 	
 	exit 0

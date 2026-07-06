@@ -297,3 +297,20 @@ options:
 ```
 # SEPcheck
 Nothing fancy, just a bash script that calls secilc.  Installer script places it in ~/.local/bin/ along with the other binaries.  Edit the file in this directory and re-run install.sh, or edit SEPcheck in ~/.local/bin/ with the relevant directory paths for your env.
+
+# SEPwalk
+Feed it your .te file and --rom-root and it will suggest additional rules you will need.  Not perfect, does help tho.  This is the major area that could use improvement. 
+```
+usage: sepolwalker [-h] --te TE --rom-root ROM_ROOT [-o OUTPUT] [-v]
+
+Walk an Android SELinux policy to find prerequisite rules required to make a
+given .te file work.
+
+options:
+  -h, --help           show this help message and exit
+  --te TE              The .te source file describing the rules you want.
+  --rom-root ROM_ROOT  Root of an extracted ROM (must contain system/fs_tree/,
+                       vendor/fs_tree/, system_ext/fs_tree/).
+  -o, --output OUTPUT  Write the report to this file instead of stdout.
+  -v, --verbose        Print extra progress info to stderr.
+```
