@@ -1,3 +1,4 @@
+# SEPinject
 ```
 usage: SEPinject [-h] [--te RULES.te] [--remove-te REMOVE.te] [--seapp SEAPP.txt]
                  [--remove-seapp REMOVE_SEAPP.txt] [--file-contexts FILE_CTX.txt]
@@ -189,4 +190,25 @@ Usage:
 
 The tool compiles a small C helper (sepatch_helper) against the system
 libsepol on first run and caches it at ~/.cache/sepinject/sepatch_helper.
+```
+# SEPclean
+```
+usage: SEPclean [-h] [-o OUTPUT] [--relocate-neverallows] [--relocate-mlsconstrains] [--dry-run] [--force] input
+
+Clean & regroup a sepinject CIL.
+
+positional arguments:
+  input
+
+options:
+  -h, --help            show this help message and exit
+  -o, --output OUTPUT   write cleaned output here and do NOT rename input (default: rename input to
+                        <input>.unclean and write the cleaned result under the input's original name)
+  --relocate-neverallows
+                        pull active rewritten neverallows from above the marker down into the mods region
+  --relocate-mlsconstrains
+                        pull active rewritten mlsconstrains (those carrying a sepinject_mlsaux_ exemption) from
+                        above the marker down into the mods region
+  --dry-run             validate and report, but write nothing
+  --force               allow overwriting an existing <input>.unclean
 ```
