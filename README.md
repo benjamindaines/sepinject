@@ -1,3 +1,10 @@
+### NOTE:
+It is recommended to run SEPcheck before making any changes, to make sure the .cil files in your ROM actually compile.  It's fairly likely that they won't.  If they don't, run SEPsani to clean them of duplicate entires across multiple partitions.  Run SEPcheck again after, it should pass at that point.. hopefully. 
+
+This toolset has only been tested during the process of building the BenOS ROM, I assume it will work generally, let me know if it doesn't or feel free to fork and submit PRs with changes that make it work more universally.
+
+Good luck, have fun.  Make frequent backups. 
+
 # SEPinject
 ```
 usage: SEPinject [-h] [--te RULES.te] [--remove-te REMOVE.te] [--seapp SEAPP.txt]
@@ -212,3 +219,81 @@ options:
   --dry-run             validate and report, but write nothing
   --force               allow overwriting an existing <input>.unclean
 ```
+# SEPsani
+```
+usage: SEPsani [-h] [--plat PLAT] [--ppv PPV] [--vendor VENDOR] [--system-ext SYSTEM_EXT] [--dry-run] [rom_root]
+
+sanitize_cil.py
+
+Clean up ROM-shipped CIL files so they can be re-compiled by secilc.
+
+Background
+----------
+This ROM's CIL files contain structural duplicates that prevent fresh
+compilation by secilc.  The precompiled_sepolicy binary was produced by
+Google's build pipeline (which uses custom CIL combiner tooling that
+handles these duplicates) — but `secilc` on Ubuntu/Linux refuses them.
+
+The duplicates appear to fall into a few specific categories:
+
+  (1) Same `(type X)` declared in both plat_sepolicy.cil and
+      plat_pub_versioned.cil.  The ppv file is supposed to hold only
+      VERSIONED types (like adbd_31_0), but here it also redeclares
+      UNVERSIONED ones that plat owns.  Solution: remove duplicates
+      from ppv, since plat is the canonical owner.
+
+  (2) Same `(typeattribute X)` declared in both files.  Same fix.
+
+  (3) Within plat_sepolicy.cil itself, `system_and_vendor_property_type`
+      is declared twice.  The second occurrence is part of an explicit
+      "workaround" block — but the type was already auto-declared earlier.
+      Solution: comment out the second occurrence.
+
+  (4) A handful of `(type X)` duplicates between plat and vendor_sepolicy.cil
+      (e.g. `proc_cpu_alignment`).  These are vendor types that plat
+      somehow also declares.  Solution: comment them out of vendor since
+      plat owns them at the platform layer.
+
+  (5) Some `(typeattributeset X ...)` lines may also conflict, especially
+      if both files claim the same attribute as a complex S-expression.
+      Solution: detect at compile time, address case by case.
+
+Usage
+-----
+    python3 sanitize_cil.py /path/to/rom/
+
+Where /path/to/rom/ is the directory containing system/, vendor/, and
+system_ext/ subtrees.  The script will locate the CIL files itself.
+
+Or pass paths explicitly:
+
+    python3 sanitize_cil.py         --plat /path/.../plat_sepolicy.cil         --ppv /path/.../plat_pub_versioned.cil         --vendor /path/.../vendor_sepolicy.cil         --system-ext /path/.../system_ext_sepolicy.cil
+
+A `.before_sanitize.bak` backup is made of each file before modification
+(skipped if a backup already exists).  All removals are by COMMENTING
+OUT the offending lines with a `; sanitize:` marker — never destructive.
+Re-running is idempotent.
+
+After running, you'll want to verify with secilc:
+
+    secilc -M true -G -N -c 30 \
+        plat_sepolicy.cil system_ext_sepolicy.cil \
+        vendor_sepolicy.cil plat_pub_versioned.cil \
+        -o /tmp/check.bin
+
+If new errors surface, address them and re-run.
+
+positional arguments:
+  rom_root              ROM root containing system/, vendor/, system_ext/
+
+options:
+  -h, --help            show this help message and exit
+  --plat PLAT           Path to plat_sepolicy.cil
+  --ppv PPV             Path to plat_pub_versioned.cil
+  --vendor VENDOR       Path to vendor_sepolicy.cil
+  --system-ext SYSTEM_EXT
+                        Path to system_ext_sepolicy.cil
+  --dry-run             Report what would change without writing
+```
+# SEPcheck
+Nothing fancy, just a bash script that calls secilc.  Installer script places it in ~/.local/bin/ along with the other binaries.  Edit the file in this directory and re-run install.sh, or edit SEPcheck in ~/.local/bin/ with the relevant directory paths for your env.
