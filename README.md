@@ -199,6 +199,7 @@ The tool compiles a small C helper (sepatch_helper) against the system
 libsepol on first run and caches it at ~/.cache/sepinject/sepatch_helper.
 ```
 # SEPreap
+This does somewhat deprecate SEPwalk.  Works slightly differently, but if you roll your intended rule changes into a ROM and run it in global permissive mode, you'll find all the real missing rules.  SEPwalk attempts to do this statically, but the results will always be better when ran though a real env.
 ```
 usage: SEPreap [-h] [--rom-root ROM_ROOT] [-d] [-D FILE] [--domain TYPE] [--domain-src TYPE] [--domain-tgt TYPE]
                [--cil] [-k] [-o OUTPUT] [-v]
