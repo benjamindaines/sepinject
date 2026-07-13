@@ -19,6 +19,17 @@ rewrites):
 BELOW the marker (the sepinject mods) is fully rebuilt:
   * All non-active (commented / disabled) lines are dropped.
   * Active statements are regrouped.
+  * allow rules ONLY are compacted, merged, and de-duplicated:
+      - a statement split across multiple physical lines is joined to one;
+      - allows sharing (subject, target, class) have their permission sets
+        unioned into a single line;
+      - exact-duplicate allows collapse to one.
+    Non-standard (multi-class / unparseable) allows are preserved verbatim,
+    deduped by exact text only.  NOTHING ELSE is merged: dontaudit,
+    auditallow, type/typeattribute(set), typetransition, genfscon, etc.
+    keep their exact count and content.  The allow merge is proven
+    content-preserving: the set of (subject, target, class, perm) grants is
+    asserted identical before/after.
   * typepermissive statements, at the very bottom.
 
 Safety: the multiset of active (paren-leading) statements is asserted
@@ -117,6 +128,72 @@ RE_ALLOW_TGTCLS = re.compile(
 def keyword(line: str):
     m = RE_KEYWORD.match(line)
     return m.group(1) if m else None
+
+
+# A fully-normalized single-class CIL allow:  (allow S T (C (p1 p2 ...)))
+# The perm group is [^()]* on purpose: any nested paren (i.e. a multi-class
+# or otherwise non-standard allow) fails to match and is treated as OPAQUE —
+# preserved verbatim rather than risk mis-merging something we don't model.
+RE_ALLOW_FULL = re.compile(
+    r"^\(\s*allow\s+(\S+)\s+(\S+)\s+\(\s*(\S+)\s+\(([^()]*)\)\s*\)\s*\)$"
+)
+
+
+def parse_allow(norm_line: str):
+    """('S','T','C', frozenset(perms)) for a standard single-class allow,
+    else None (opaque — do not merge)."""
+    m = RE_ALLOW_FULL.match(norm_line)
+    if not m:
+        return None
+    s, t, c, praw = m.group(1), m.group(2), m.group(3), m.group(4)
+    perms = frozenset(p for p in re.split(r"[\s,]+", praw.strip()) if p)
+    if not perms:
+        return None
+    return s, t, c, perms
+
+
+def _code_part(line: str) -> str:
+    """Line with any trailing ';' CIL comment stripped (for paren counting)."""
+    i = line.find(";")
+    return line if i < 0 else line[:i]
+
+
+def coalesce_statements(lines):
+    """Join multi-physical-line CIL statements into single logical lines.
+
+    Yields (logical_line, physical_span).  A logical line that starts (after
+    whitespace) with '(' is accumulated until its parens balance, then the
+    pieces are whitespace-joined.  Non-active lines (comments, blanks,
+    disabled ';...' rules) pass through one-for-one with span 1.  Only the
+    active-statement paren depth drives joining; comment text is ignored via
+    _code_part.
+    """
+    buf = []
+    depth = 0
+    span = 0
+    for line in lines:
+        if not buf:
+            if line.lstrip().startswith("("):
+                buf = [line]
+                span = 1
+                depth = _code_part(line).count("(") - _code_part(line).count(")")
+                if depth <= 0:
+                    yield " ".join(" ".join(buf).split()), span
+                    buf, depth, span = [], 0, 0
+            else:
+                yield line, 1
+        else:
+            buf.append(line)
+            span += 1
+            depth += _code_part(line).count("(") - _code_part(line).count(")")
+            if depth <= 0:
+                yield " ".join(" ".join(x.strip() for x in buf).split()), span
+                buf, depth, span = [], 0, 0
+    if buf:
+        # Unbalanced tail — emit pieces as-is so downstream balance checks fail
+        # loudly rather than silently swallowing a malformed statement.
+        for x in buf:
+            yield x, 1
 
 
 class Stmt:
@@ -323,9 +400,38 @@ def build_below(below_lines, relocated, relocated_mls=None):
             for s in tts:
                 out.append(s.raw); rendered.add(id(s))
 
-        allows = sorted([s for s in bucket if s.kw in ("allow", "auditallow")],
-                        key=lambda x: x.allow_sortkey())
-        for s in allows:
+        # ---- allow rules: compact + merge + dedup (allow ONLY) -----------
+        # Group standard single-class allows by (subject, target, class) and
+        # union their permission sets, so multi-line / split / duplicate
+        # allows collapse to one compact line.  Non-standard allows that
+        # don't parse are kept verbatim (deduped by exact text only).
+        raw_allows = [s for s in bucket if s.kw == "allow"]
+        merged = OrderedDict()      # (S,T,C) -> set(perms)
+        opaque_seen = set()
+        opaque_lines = []
+        for s in raw_allows:
+            rendered.add(id(s))
+            p = parse_allow(s.raw)
+            if p is None:
+                if s.raw not in opaque_seen:
+                    opaque_seen.add(s.raw)
+                    opaque_lines.append(s)
+                continue
+            S, T, C, perms = p
+            merged.setdefault((S, T, C), set()).update(perms)
+        merged_lines = []
+        for (S, T, C), perms in merged.items():
+            line = f"(allow {S} {T} ({C} ({' '.join(sorted(perms))})))"
+            merged_lines.append(((T, C, line), line))
+        for _, line in sorted(merged_lines, key=lambda x: x[0]):
+            out.append(line)
+        for s in sorted(opaque_lines, key=lambda x: x.allow_sortkey()):
+            out.append(s.raw)
+
+        # auditallow is NOT an allow rule — preserved exactly (count + text).
+        aas = sorted([s for s in bucket if s.kw == "auditallow"],
+                     key=lambda x: x.allow_sortkey())
+        for s in aas:
             out.append(s.raw); rendered.add(id(s))
 
         das = sorted([s for s in bucket if s.kw == "dontaudit"],
@@ -471,14 +577,76 @@ def validate(above_in, above_out, below_in, below_out_lines,
         if ai != ao:
             errors.append("ABOVE active multiset changed")
 
-    bi = active_norms(below_in)
-    bo = active_norms(below_out_lines)
-    expected = bi + (rc if relocate else Counter()) \
-                  + (rc_mls if relocate_mls else Counter())
-    if bo != expected:
-        missing = expected - bo
-        extra = bo - expected
-        errors.append("BELOW active multiset mismatch")
+    # --- BELOW: allow rules may be compacted/merged/deduped; everything
+    #     else must be preserved exactly.  We therefore validate the
+    #     SEMANTIC content of allow rules (the set of (S,T,C,perm) grants)
+    #     rather than the raw line multiset. ------------------------------
+    def split_active(lines):
+        """-> (allow_grant_tuples:set, opaque_allow:Counter, other:Counter)"""
+        grants = set()
+        opaque = Counter()
+        other = Counter()
+        for l in lines:
+            if not is_active(l):
+                continue
+            n = norm(l)
+            kw = keyword(n)
+            if kw == "allow":
+                p = parse_allow(n)
+                if p is None:
+                    opaque[n] += 1
+                else:
+                    s, t, c, perms = p
+                    for pm in perms:
+                        grants.add((s, t, c, pm))
+            else:
+                other[n] += 1
+        return grants, opaque, other
+
+    in_grants, in_opaque, in_other = split_active(below_in)
+    out_grants, out_opaque, out_other = split_active(below_out_lines)
+
+    # relocated neverallows / mlsconstrains are non-allow -> land in 'other'
+    reloc_other = (rc if relocate else Counter()) \
+                + (rc_mls if relocate_mls else Counter())
+
+    # 1) no allow grant invented or lost
+    if in_grants != out_grants:
+        lost = in_grants - out_grants
+        added = out_grants - in_grants
+        errors.append("BELOW allow grants changed (merge/dedup must be "
+                      "content-preserving)")
+        for g in list(lost)[:8]:
+            errors.append(f"   LOST  grant: {g}")
+        for g in list(added)[:8]:
+            errors.append(f"   ADDED grant: {g}")
+
+    # 2) compaction actually happened: no (S,T,C) split across >1 out line
+    out_stc = Counter()
+    for l in below_out_lines:
+        if is_active(l) and keyword(norm(l)) == "allow":
+            p = parse_allow(norm(l))
+            if p:
+                out_stc[(p[0], p[1], p[2])] += 1
+    dup_stc = {k: v for k, v in out_stc.items() if v > 1}
+    if dup_stc:
+        errors.append("BELOW allow rules not fully compacted "
+                      "(same subject:target:class on multiple lines)")
+        for k, v in list(dup_stc.items())[:8]:
+            errors.append(f"   x{v}: {k}")
+
+    # 3) opaque (unparseable) allows: deduped to unique, none invented/lost
+    if set(in_opaque) != set(out_opaque):
+        errors.append("BELOW opaque-allow set changed")
+    if any(v != 1 for v in out_opaque.values()):
+        errors.append("BELOW opaque allow still duplicated after clean")
+
+    # 4) every non-allow active statement preserved exactly (+ relocations)
+    expected_other = in_other + reloc_other
+    if out_other != expected_other:
+        missing = expected_other - out_other
+        extra = out_other - expected_other
+        errors.append("BELOW non-allow active multiset mismatch")
         for k, v in list(missing.items())[:8]:
             errors.append(f"   MISSING x{v}: {k}")
         for k, v in list(extra.items())[:8]:
@@ -529,7 +697,17 @@ def main():
 
     above_in = lines[:mi]
     marker = lines[mi]
-    below_in = lines[mi + 1:]
+    below_in_raw = lines[mi + 1:]
+
+    # Coalesce multi-physical-line statements below the marker into single
+    # logical lines FIRST, so split allow rules parse & merge correctly and
+    # continuation lines aren't miscounted as separate active statements.
+    below_in = []
+    n_multiline_allow = 0
+    for logical, span in coalesce_statements(below_in_raw):
+        below_in.append(logical)
+        if span > 1 and is_active(logical) and keyword(norm(logical)) == "allow":
+            n_multiline_allow += 1
 
     above_out, relocated, relocated_mls = process_above(
         above_in, args.relocate_neverallows, args.relocate_mlsconstrains)
@@ -549,7 +727,10 @@ def main():
         result += "\n"
 
     # ---- report ----
-    kw_in = Counter(keyword(norm(l)) for l in below_in if is_active(l))
+    kw_in = Counter(keyword(l) for l in below_in if is_active(l))
+    in_allow_lines = kw_in.get("allow", 0)
+    out_allow_lines = sum(1 for l in below_out
+                          if is_active(l) and keyword(norm(l)) == "allow")
     print("[OK] validation passed")
     print(f"  above: {len(above_in)} -> {len(above_out)} lines "
           f"({len(above_in) - len(above_out)} sepinject comment lines stripped)")
@@ -557,9 +738,13 @@ def main():
         print(f"  relocated neverallows: {len(relocated)}")
     if args.relocate_mlsconstrains:
         print(f"  relocated mlsconstrains: {len(relocated_mls)}")
-    print(f"  below: {len(below_in)} -> {len(below_out)} lines")
-    print("  below active statement counts (preserved):")
-    for k in sorted(kw_in):
+    print(f"  below: {len(below_in_raw)} -> {len(below_out)} lines")
+    print(f"  allow rules: {in_allow_lines} -> {out_allow_lines} "
+          f"({in_allow_lines - out_allow_lines} merged/deduped"
+          + (f", {n_multiline_allow} multi-line compacted"
+             if n_multiline_allow else "") + ")")
+    print("  below active statement counts (allow merged; others preserved):")
+    for k in sorted(x for x in kw_in if x):
         print(f"     {k:16} {kw_in[k]}")
 
     if args.dry_run:

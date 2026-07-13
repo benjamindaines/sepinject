@@ -5184,6 +5184,13 @@ def validate_policy(rom_root: Path,
 
 REBUILD_MODS_MARKER_DEFAULT = '; ~~~:BEGIN_MODS:~~~'
 
+# Substring form used to detect the marker regardless of surrounding
+# whitespace.  The mods marker delimits the sepinject-managed region of a
+# CIL file; downstream suite tools (SEPclean compaction/dedup, SEPwalk
+# --rebuild-neverallows) locate the mods region by this substring, so
+# patch_cil lays one down before the first modification to a virgin file.
+MODS_MARKER_SUBSTR = '~~~:BEGIN_MODS:~~~'
+
 # Matches a single-line CIL allow statement, e.g.:
 #   (allow shell fuse (file (read open)))
 # Captures: 1=src, 2=tgt, 3=cls, 4=raw perms string.
@@ -6551,8 +6558,24 @@ def patch_cil(cil_path: Path, rules: list[TeRule]) -> bool:
         print("  [~] No new CIL statements to add")
         return True
 
+    # Lay down the mods marker before the first modification if the file
+    # doesn't already carry one.  Everything sepinject appends lands at EOF,
+    # so a marker inserted here keeps all mods below it — which is what the
+    # rest of the suite (SEPclean, SEPwalk --rebuild-neverallows) relies on.
+    prefix_lines = []
+    if MODS_MARKER_SUBSTR not in existing:
+        print(f"  [+] No mods marker found — inserting "
+              f"{REBUILD_MODS_MARKER_DEFAULT!r} before first modification "
+              f"(delimits the sepinject-managed region for SEPclean/SEPwalk)")
+        prefix_lines = ['', REBUILD_MODS_MARKER_DEFAULT, '']
+
+    # Ensure the append starts on its own line even if the existing file did
+    # not end in a newline, so the marker/first statement can't fuse onto a
+    # trailing stock line.
+    lead = '' if existing.endswith('\n') or not existing else '\n'
+
     with open(cil_path, 'a') as f:
-        f.write('\n'.join(new_lines))
+        f.write(lead + '\n'.join(prefix_lines + new_lines))
 
     print(f"  [+] Added {len(additions)} CIL statement(s)")
     return True
