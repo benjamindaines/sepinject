@@ -198,6 +198,35 @@ Usage:
 The tool compiles a small C helper (sepatch_helper) against the system
 libsepol on first run and caches it at ~/.cache/sepinject/sepatch_helper.
 ```
+# SEPreap
+```
+usage: SEPreap [-h] [--rom-root ROM_ROOT] [-d] [-D FILE] [--domain TYPE] [--domain-src TYPE] [--domain-tgt TYPE]
+               [--cil] [-k] [-o OUTPUT] [-v]
+               [logs ...]
+
+Reap AVC denials from logs into .te rules, grouped by domain, paste-ready for SEPinject.
+
+positional arguments:
+  logs                  dmesg / logcat / audit.log files (default: stdin). Use '-' for stdin explicitly.
+
+options:
+  -h, --help            show this help message and exit
+  --rom-root ROM_ROOT   Root of an extracted ROM (system/fs_tree/, vendor/fs_tree/, system_ext/fs_tree/). When
+                        given, source/target types are checked against the ROM CIL.
+  -d, --dontaudit       Classify noise-table denials into dontaudit rules instead of allow. OFF by default.
+  -D, --dontaudit-rules FILE
+                        Extra noise rules appended to the built-in table (one 'ttype/tclass:perm' per line). Implies
+                        -d.
+  --domain TYPE         Only reap denials where TYPE appears in EITHER the source or target context. Repeatable;
+                        accepts globs (e.g. --domain 'hal_*'). A 'self' target counts as its source type.
+  --domain-src TYPE     Like --domain but pinned to the source (subject) context only. Repeatable; accepts globs.
+  --domain-tgt TYPE     Like --domain but pinned to the target (object) context only. Repeatable; accepts globs.
+  --cil                 Also emit a CIL form of each rule beneath the .te line (for direct secilc / SEPclean
+                        workflows).
+  -k, --keep-cats       Annotate each rule with its scontext MLS categories.
+  -o, --output OUTPUT   Write report here instead of stdout.
+  -v, --verbose         Print progress to stderr.
+```
 # SEPclean
 ```
 usage: SEPclean [-h] [-o OUTPUT] [--relocate-neverallows] [--relocate-mlsconstrains] [--dry-run] [--force] input
