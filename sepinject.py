@@ -5356,7 +5356,9 @@ def rebuild_neverallows(rom_root: Path,
                         skip_sha256: bool = False,
                         plat_only: bool = False,
                         assume_yes: bool = False,
-                        marker: str = REBUILD_MODS_MARKER_DEFAULT) -> int:
+                        marker: str = REBUILD_MODS_MARKER_DEFAULT,
+                        only_domain: Optional[str] = None) -> int:
+
     """Top-level driver for --rebuild-neverallows.
 
        Returns 0 on success / no conflicts, 1 on failure, 2 if the user
@@ -5397,6 +5399,16 @@ def rebuild_neverallows(rom_root: Path,
         return 0
 
     print(f"\n[*] Total user-mod allow rules collected: {len(all_rules)}")
+
+    if only_domain:
+        _before = len(all_rules)
+        all_rules = [r for r in all_rules if getattr(r, "src", None) == only_domain]
+        print(f"[*] Domain filter: rule.src == {only_domain!r} "
+              f"({_before} -> {len(all_rules)} rule(s))")
+        if not all_rules:
+            print(f"\n[OK] No user-mod allow rules with src == {only_domain!r} "
+                  f"- nothing to rebuild.")
+            return 0
 
     # ---- Phase 2: conflict scan against full set of CIL neverallows ----
     print("\n[*] Scanning CIL files for neverallow conflicts")
@@ -7155,6 +7167,371 @@ def find_policies_in_rom(rom_root: Path) -> list[Path]:
         found.append(p)
     return found
 
+# ===========================================================================
+# Global permissive policy (--global-permissive-policy)
+#
+# Mechanism (verified against secilc 33):
+#   - Every concrete member of the `domain` attribute receives a
+#     `(typepermissive T)` line inside a sentinel-delimited block appended to
+#     plat_sepolicy.cil.  All CIL files compile together at boot, so a single
+#     block in plat covers types declared in vendor / system_ext as well.
+#   - `typepermissive` sets a runtime bit; it adds no allow rule and is not
+#     evaluated by neverallow assertions.  The transition therefore performs no
+#     neverallow handling and cannot fail a compile on account of a neverallow.
+#   - dontaudit statements are suppressed in place by a reversible tag prefix so
+#     that denials normally silenced remain visible while permissive.
+#   - The block plus the tag prefix constitute a self-describing, in-file filter:
+#     disable removes exactly the enablement footprint and leaves any edits made
+#     while permissive untouched.
+# ===========================================================================
+
+import json as _gp_json
+
+GP_BEGIN = ";; >>> sepinject: global-permissive BEGIN"
+GP_END   = ";; <<< sepinject: global-permissive END"
+GP_BLOCK_HEADER = (
+    ";; typepermissive emitted per concrete member of the domain attribute.\n"
+    ";; permissive is a runtime bit; it adds no allow rule and is not\n"
+    ";; evaluated by neverallow assertions.  Denials in these domains are\n"
+    ";; logged, not enforced.  Removed wholesale when permissive is disabled."
+)
+# Prefix marking a dontaudit statement suppressed by this feature.  A single
+# ';' opens a CIL comment to end-of-line, so the tagged line is inert; the exact
+# prefix is stripped to restore the original statement.  CIL statements are
+# assumed single-line, consistent with the rest of this tool.
+GP_DA_TAG = ";;sepinject-da;; "
+
+GP_STATE_DIR = Path.home() / ".config" / "sepinject" / "permissive"
+GP_BASELINE_DIR = GP_STATE_DIR / "baseline"
+
+
+def _gp_plat_cil(cil_paths: list) -> Optional[Path]:
+    """Return the plat_sepolicy.cil path from a (label, Path) list, or None."""
+    for _, p in cil_paths:
+        if p and p.name == "plat_sepolicy.cil":
+            return p
+    return None
+
+
+def _gp_state(plat_cil: Path) -> str:
+    """Return 'enabled' if the sentinel block is present in plat, else 'disabled'.
+
+       State is derived from the artifact itself; no external state file is
+       consulted, so the reading is correct even after out-of-band edits.
+    """
+    if not plat_cil or not plat_cil.exists():
+        return "disabled"
+    return "enabled" if GP_BEGIN in plat_cil.read_text(errors="replace") else "disabled"
+
+
+def _gp_domain_members(cil_paths: list) -> list:
+    """Resolve the concrete type members of the `domain` attribute across the
+       combined CIL closure and return them sorted.
+
+       Reuses the tool's own attribute resolver so enumeration matches how
+       neverallows resolve the same expression.  Attributes and the self token
+       are filtered out; only declared concrete types remain.
+    """
+    _, attr_map, all_types = find_neverallow_conflicts([], cil_paths)
+    resolved = _na_resolve_set("domain", attr_map, all_types)
+    if resolved is None:
+        raise RuntimeError(
+            "the `domain` attribute did not resolve to a concrete type set; "
+            "refusing to emit an incomplete permissive block")
+    members = sorted(
+        t for t in resolved
+        if t in all_types and t not in attr_map and t != "__SELF__")
+    return members
+
+
+def _gp_tag_dontaudits(path: Path, rollback: "RollbackSession") -> int:
+    """Comment out every dontaudit statement in `path` with GP_DA_TAG.
+
+       Already-tagged lines are skipped, so the operation is idempotent.
+       Returns the count of newly tagged statements.
+    """
+    if not path or not path.exists():
+        return 0
+    text = path.read_text(errors="replace")
+    lines = text.splitlines(keepends=True)
+    changed = 0
+    out = []
+    for ln in lines:
+        stripped = ln.lstrip()
+        if stripped.startswith("(dontaudit") and not stripped.startswith(GP_DA_TAG.strip()):
+            eol = "\n" if ln.endswith("\n") else ""
+            body = ln[:-1] if eol else ln
+            out.append(GP_DA_TAG + body + eol)
+            changed += 1
+        else:
+            out.append(ln)
+    if changed:
+        rollback.snapshot(path)
+        path.write_text("".join(out))
+    return changed
+
+
+def _gp_untag_dontaudits(path: Path, rollback: "RollbackSession") -> int:
+    """Strip GP_DA_TAG from every line it prefixes.  Returns the count restored."""
+    if not path or not path.exists():
+        return 0
+    lines = path.read_text(errors="replace").splitlines(keepends=True)
+    changed = 0
+    out = []
+    for ln in lines:
+        if ln.startswith(GP_DA_TAG):
+            out.append(ln[len(GP_DA_TAG):])
+            changed += 1
+        else:
+            out.append(ln)
+    if changed:
+        rollback.snapshot(path)
+        path.write_text("".join(out))
+    return changed
+
+
+def _gp_emit_block(plat_cil: Path, members: list, rollback: "RollbackSession") -> int:
+    """Append the sentinel-delimited typepermissive block to plat.
+
+       No-op if the block is already present.  Returns the number of
+       typepermissive lines written.
+    """
+    text = plat_cil.read_text(errors="replace")
+    if GP_BEGIN in text:
+        return 0
+    rollback.snapshot(plat_cil)
+    body = "\n".join(f"(typepermissive {t})" for t in members)
+    block = f"\n{GP_BEGIN}\n{GP_BLOCK_HEADER}\n{body}\n{GP_END}\n"
+    if not text.endswith("\n"):
+        text += "\n"
+    plat_cil.write_text(text + block)
+    return len(members)
+
+
+def _gp_remove_block(plat_cil: Path, rollback: "RollbackSession") -> bool:
+    """Delete the sentinel-delimited block, and the single blank line enable
+       inserted before it.  Returns True if a block was removed.
+    """
+    text = plat_cil.read_text(errors="replace")
+    if GP_BEGIN not in text:
+        return False
+    rollback.snapshot(plat_cil)
+    lines = text.splitlines()
+    b = e = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == GP_BEGIN.strip():
+            b = i
+        elif ln.strip() == GP_END.strip():
+            e = i
+            break
+    if b is None or e is None or e < b:
+        raise RuntimeError("global-permissive sentinels present but malformed; "
+                           "restore from the out-of-tree baseline")
+    if b > 0 and lines[b - 1].strip() == "":
+        b -= 1  # absorb the blank line enable inserted
+    del lines[b:e + 1]
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    plat_cil.write_text("\n".join(lines) + "\n")
+    return True
+
+
+def _gp_backup_baseline(cil_paths: list) -> Path:
+    """Copy every targeted CIL to a timestamped, immutable out-of-tree baseline
+       and record a manifest.  This is the break-glass bootable copy; it is
+       never the routine disable path (restoring it discards edits made while
+       permissive).  A new timestamped directory is created each call; nothing
+       is overwritten.
+    """
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dest = GP_BASELINE_DIR / ts
+    dest.mkdir(parents=True, exist_ok=True)
+    manifest = {"timestamp": ts, "files": []}
+    for label, p in cil_paths:
+        if not p or not p.exists():
+            continue
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        shutil.copy2(p, dest / p.name)
+        manifest["files"].append({"label": label, "path": str(p),
+                                  "name": p.name, "sha256": digest})
+    (dest / "MANIFEST.json").write_text(_gp_json.dumps(manifest, indent=2))
+    return dest
+
+
+def _gp_write_audit(action: str, plat_cil: Path, members: int,
+                    da_counts: dict) -> None:
+    """Record what the transition changed, for audit and integrity checks.
+
+       The in-file sentinels and tags remain the authoritative filter; this
+       record is a cross-check, letting disable report divergence between what
+       enablement wrote and what is present.
+    """
+    GP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": time.strftime("%Y%m%d-%H%M%S"),
+        "action": action,
+        "plat_cil": str(plat_cil),
+        "typepermissive_lines": members,
+        "dontaudit_suppressed_by_file": da_counts,
+    }
+    (GP_STATE_DIR / "last_transition.json").write_text(
+        _gp_json.dumps(record, indent=2))
+
+
+def global_permissive_policy(rom_root: Path,
+                             action: str = "toggle",
+                             dry_run: bool = False,
+                             skip_sha256: bool = False,
+                             plat_only: bool = False,
+                             assume_yes: bool = False) -> int:
+    """Top-level driver for --global-permissive-policy.
+
+       action is one of: status, enable, disable, toggle.
+       Returns 0 on success / no-op, 1 on failure, 2 if the user declined.
+    """
+    print("\n" + "=" * 70)
+    print("[*] Global permissive policy")
+    print(f"    rom-root:    {rom_root}")
+    print(f"    action:      {action}")
+    print(f"    dry-run:     {dry_run}")
+    print(f"    plat-only:   {plat_only}")
+    print("=" * 70)
+
+    cil_paths = find_rom_sepolicy_cils(rom_root, plat_only=plat_only)
+    if not cil_paths:
+        print(f"[!] No *sepolicy.cil files found under {rom_root}.  Nothing to do.")
+        return 1
+    plat_cil = _gp_plat_cil(cil_paths)
+    if not plat_cil:
+        print("[!] plat_sepolicy.cil not found among targeted files — cannot "
+              "place the permissive block.")
+        return 1
+    for label, p in cil_paths:
+        print(f"    target:   {label:<22s} {p}")
+
+    state = _gp_state(plat_cil)
+    print(f"\n[*] Current state: {state.upper()}")
+
+    if action == "status":
+        return 0
+    if action == "toggle":
+        action = "disable" if state == "enabled" else "enable"
+        print(f"[*] Toggle resolves to: {action.upper()}")
+
+    if action == "enable" and state == "enabled":
+        print("[~] Already enabled — nothing to do.")
+        return 0
+    if action == "disable" and state == "disabled":
+        print("[~] Already disabled — nothing to do.")
+        return 0
+
+    # ---- preview the transition footprint ----
+    try:
+        members = _gp_domain_members(cil_paths) if action == "enable" else []
+    except RuntimeError as e:
+        print(f"[!] {e}")
+        return 1
+    da_preview = {}
+    for label, p in cil_paths:
+        if not p or not p.exists():
+            continue
+        n = sum(1 for ln in p.read_text(errors="replace").splitlines()
+                if (ln.lstrip().startswith("(dontaudit")
+                    if action == "enable"
+                    else ln.startswith(GP_DA_TAG)))
+        da_preview[p.name] = n
+
+    if action == "enable":
+        print(f"\n[*] Would mark {len(members)} domain(s) permissive.")
+    else:
+        print("\n[*] Would remove the permissive block and restore dontaudits.")
+    print("[*] dontaudit statements affected per file:")
+    for name, n in da_preview.items():
+        print(f"      {name:<28s} {n}")
+
+    if dry_run:
+        print("\n[OK] Dry-run complete — re-run without --dry-run to apply.")
+        return 0
+
+    if not assume_yes:
+        try:
+            ans = input(f"\nFlip policy to {action.upper()}? [y/N]: ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("[!] Declined — no files modified.")
+            return 2
+
+    # ---- persistent recovery copies ----
+    if action == "enable":
+        baseline = _gp_backup_baseline(cil_paths)
+        print(f"[*] Immutable baseline captured: {baseline}")
+    else:
+        # Snapshot the permissive state in place before dismantling it, so a
+        # botched un-transform does not cost the permissive work.
+        for _, p in cil_paths:
+            if p and p.exists():
+                snap = p.with_suffix(p.suffix + ".permissive")
+                shutil.copy2(p, snap)
+        print("[*] In-place .permissive snapshots written.")
+
+    # ---- in-run atomicity: snapshot CIL + all sha256 sidecars ----
+    rollback = RollbackSession()
+    print(f"[*] Rollback snapshot dir: {rollback.session_dir}")
+    for _, p in cil_paths:
+        if p and p.exists():
+            rollback.snapshot(p)
+    sys_sel = rom_root / ROM_SYSTEM_SELINUX
+    sext_sel = rom_root / ROM_SYSTEM_EXT_SELINUX
+    vnd_sel = rom_root / ROM_VENDOR_SELINUX
+    for sc in (sys_sel / "plat_sepolicy_and_mapping.sha256",
+               vnd_sel / "precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+               sext_sel / "system_ext_sepolicy_and_mapping.sha256",
+               vnd_sel / "precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256"):
+        if sc.exists():
+            rollback.snapshot(sc)
+
+    # ---- apply ----
+    da_counts = {}
+    try:
+        if action == "enable":
+            for _, p in cil_paths:
+                da_counts[p.name] = _gp_tag_dontaudits(p, rollback)
+            n_perm = _gp_emit_block(plat_cil, members, rollback)
+            print(f"[+] Emitted {n_perm} typepermissive line(s) into {plat_cil.name}.")
+        else:
+            for _, p in cil_paths:
+                da_counts[p.name] = _gp_untag_dontaudits(p, rollback)
+            _gp_remove_block(plat_cil, rollback)
+            print(f"[+] Removed permissive block from {plat_cil.name}.")
+        for name, n in da_counts.items():
+            if n:
+                print(f"      {name:<28s} {n} dontaudit(s) "
+                      f"{'suppressed' if action == 'enable' else 'restored'}")
+    except Exception as e:
+        print(f"\n[!] Transition failed: {e}")
+        rollback.revert()
+        return 1
+
+    # ---- sha256 sidecars: recomputed so init recompiles and trusts the result ----
+    sha_ok: Optional[bool] = None
+    if not skip_sha256:
+        if sys_sel.is_dir():
+            sha_ok = update_sha256(sys_sel,
+                                   vnd_sel if vnd_sel.is_dir() else None,
+                                   sext_sel if sext_sel.is_dir() else None)
+        else:
+            print("[~] No system selinux dir — skipping SHA-256 update.")
+
+    _gp_write_audit(action, plat_cil, len(members), da_counts)
+
+    if skip_sha256 or sha_ok is not False:
+        rollback.commit()
+        print(f"\n[OK] Global permissive {action}d.")
+        return 0
+    print("\n[!] SHA-256 update failed; snapshot retained at "
+          f"{rollback.session_dir}")
+    return 1
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -7361,6 +7738,23 @@ def main():
                              'at once.  Same standalone requirements/flags as '
                              '--recreate-mlsconstrains.')
 
+    parser.add_argument('--rebuild-neverallows-domain', metavar='DOMAIN', default=None,
+                        help='Like --rebuild-neverallows, but only process '
+                             'mod allow rules whose source domain is DOMAIN '
+                             '(rule.src == DOMAIN).  Neverallow analogue of '
+                             '--recreate-mls-domain.  Same standalone '
+                             'requirements/flags as --rebuild-neverallows.')
+
+    parser.add_argument('--global-permissive-policy', nargs='?',
+                        choices=('status', 'enable', 'disable', 'toggle'),
+                        const='toggle', default=None,
+                        help='Mark every domain permissive via a '
+                             'sentinel-delimited CIL block and suppress '
+                             'dontaudits.  With no argument, toggles on '
+                             'detected state; accepts '
+                             'status|enable|disable|toggle.  Standalone; '
+                             'requires --rom-root.')
+
     # ---- Inline mlsconstrain pre-flight (opt-in) ----
     parser.add_argument('--check-mlsconstrains', action='store_true',
                         help='During a normal --te patch run, ALSO scan for '
@@ -7428,9 +7822,28 @@ def main():
     # and exits when done.  Combinable with --dry-run / --skip-sha256 /
     # --plat-cil-only / --yes.  Incompatible with rule-injection flags
     # since the "rules" come from the user's existing CIL modifications.
-    if args.rebuild_neverallows:
+    if args.global_permissive_policy is not None:
+        if not args.rom_root:
+            parser.error("--global-permissive-policy requires --rom-root")
+        if (args.te or args.remove_te or args.seapp or args.remove_seapp
+                or args.file_contexts or args.property_contexts
+                or args.service_contexts or args.hwservice_contexts
+                or args.validate or args.validate_full
+                or args.rebuild_neverallows or args.rebuild_neverallows_domain
+                or args.recreate_mlsconstrains or args.recreate_mls_domain):
+            parser.error("--global-permissive-policy is standalone")
+        rr = Path(args.rom_root)
+        if not rr.exists() or not rr.is_dir():
+            parser.error(f"--rom-root path does not exist: {rr}")
+        sys.exit(global_permissive_policy(
+            rom_root=rr, action=args.global_permissive_policy,
+            dry_run=args.dry_run, skip_sha256=args.skip_sha256,
+            plat_only=args.plat_cil_only, assume_yes=args.assume_yes))
+
+    if args.rebuild_neverallows or args.rebuild_neverallows_domain:
         if not args.rom_root:
             parser.error("--rebuild-neverallows requires --rom-root")
+
         if (args.te or args.remove_te or args.seapp or args.remove_seapp
                 or args.file_contexts or args.property_contexts
                 or args.service_contexts or args.hwservice_contexts
@@ -7449,6 +7862,8 @@ def main():
             plat_only=args.plat_cil_only,
             assume_yes=args.assume_yes,
             marker=args.rebuild_mods_marker,
+            only_domain=args.rebuild_neverallows_domain,
+
         )
         sys.exit(code)
 
@@ -7464,7 +7879,7 @@ def main():
                 or args.file_contexts or args.property_contexts
                 or args.service_contexts or args.hwservice_contexts
                 or args.validate or args.validate_full
-                or args.rebuild_neverallows):
+                or args.rebuild_neverallows or args.rebuild_neverallows_domain):
             parser.error("--recreate-mlsconstrains is standalone — do not "
                          "combine with --te / --remove-te / --seapp / "
                          "--*-contexts / --validate / --rebuild-neverallows "

@@ -365,6 +365,127 @@ def build_rules(denials: List[Denial], noise: Optional[NoiseTable]
         by_domain.setdefault(r.src, []).append(r)
     return by_domain
 
+# ===========================================================================
+# Permissive triage (SEPreap)
+#
+# SEPreap already records, per emitted Rule, whether every contributing denial
+# fired in a permissive domain (Rule.permissive_only).  Those rules are the
+# silent ones: the operation succeeded only because the domain was permissive,
+# so nothing broke at runtime and nothing surfaced — yet each is a landmine for
+# the return to enforcing.  This pass splits the silent rules into two classes:
+#
+#   1. allow-and-re-enforce — no neverallow forbids the access; adding the rule
+#      and re-enforcing is sufficient.
+#   2. neverallow-blocked — a neverallow forbids the access; a plain allow will
+#      fail the next CIL recompile.  These are the domains to run through
+#      `sepinject --rebuild-neverallows-domain DOMAIN`.
+#
+# Neverallow resolution is delegated to sepinject so the semantics match the
+# tool that will act on the result.  When sepinject or a rom-root is
+# unavailable, the pass degrades to reporting the silent rules without the
+# neverallow split.
+# ===========================================================================
+
+from typing import Dict, List, Optional
+from pathlib import Path
+import sys
+
+
+def permissive_triage(by_domain: "Dict[str, List]",
+                      rom_root: "Optional[Path]",
+                      out=sys.stdout) -> int:
+    """Print the permissive-triage section.  Returns the count of
+       neverallow-blocked domains (0 when none, or when the split is
+       unavailable).
+    """
+    p = lambda *a: print(*a, file=out)
+
+    silent = [r for rules in by_domain.values() for r in rules
+              if getattr(r, "permissive_only", False) and r.verb == "allow"]
+    if not silent:
+        return 0
+
+    p("")
+    p("# " + "=" * 72)
+    p("# Permissive triage — accesses that succeeded only because a domain was")
+    p("# permissive.  Each will be denied once the policy returns to enforcing.")
+    p("# " + "=" * 72)
+
+    conflicts = None
+    if rom_root is not None:
+        try:
+            import os
+            from sepinject import (find_rom_sepolicy_cils,
+                                    find_neverallow_conflicts, TeRule)
+            cil_paths = find_rom_sepolicy_cils(Path(rom_root))
+            probes = [TeRule(op="allow", src=r.src, tgt=r.tgt,
+                             cls=r.tclass, perms=sorted(r.perms))
+                      for r in silent]
+            # Suppress the scanner's own stdout so it cannot contaminate an
+            # emitted .te when out is the real stdout.
+            _saved = sys.stdout
+            try:
+                sys.stdout = open(os.devnull, "w")
+                conflicts, _attr, _types = find_neverallow_conflicts(
+                    probes, cil_paths)
+            finally:
+                sys.stdout.close()
+                sys.stdout = _saved
+        except Exception as e:
+            p(f"# neverallow split unavailable ({e.__class__.__name__}: {e});")
+            p("# reporting silent accesses without neverallow classification.")
+            conflicts = None
+
+    if conflicts is None:
+        for r in sorted(silent, key=lambda r: (r.src, r.tgt, r.tclass)):
+            ps = " ".join(sorted(r.perms))
+            p(f"#   allow {r.src} {r.tgt}:{r.tclass} {{ {ps} }};")
+        return 0
+
+    # Map (src,tgt,cls) -> {blocked_perm: neverallow}.  A neverallow constrains
+    # specific permissions, so classification is per-perm: one rule may be partly
+    # blocked (needs a carve-out) and partly clean (a plain allow suffices).
+    blocked_perms: dict = {}
+    for c in conflicts:
+        key = (c.rule.src, c.rule.tgt, c.rule.cls)
+        slot = blocked_perms.setdefault(key, {})
+        for perm in c.matched_perms:
+            slot.setdefault(perm, c.neverallow)
+
+    blocked_domains = set()
+    blocked_lines = []
+    free_lines = []
+    for r in sorted(silent, key=lambda r: (r.src, r.tgt, r.tclass)):
+        slot = blocked_perms.get((r.src, r.tgt, r.tclass), {})
+        rb = sorted(p for p in r.perms if p in slot)
+        rf = sorted(p for p in r.perms if p not in slot)
+        if rb:
+            blocked_domains.add(r.src)
+            blocked_lines.append(f"#   allow {r.src} {r.tgt}:{r.tclass} "
+                                 f"{{ {' '.join(rb)} }};")
+            for na in {slot[p].raw_line.strip() for p in rb}:
+                blocked_lines.append(f"#       blocked by: {na}")
+        if rf:
+            free_lines.append(f"#   allow {r.src} {r.tgt}:{r.tclass} "
+                              f"{{ {' '.join(rf)} }};")
+
+    p("")
+    p("# --- neverallow-blocked (a plain allow will FAIL the next recompile) ---")
+    for ln in blocked_lines or ["#   (none)"]:
+        p(ln)
+    p("")
+    p("# --- allow-and-re-enforce (no neverallow forbids these) ---")
+    for ln in free_lines or ["#   (none)"]:
+        p(ln)
+
+    if blocked_domains:
+        joined = " ".join(f"--rebuild-neverallows-domain {d}"
+                          for d in sorted(blocked_domains))
+        p("")
+        p("# To carve the neverallows for the blocked domains, run sepinject with:")
+        p(f"#   {joined}")
+    return len(blocked_domains)
+
 
 # ----------------------------------------------------------------------------
 # Emit
@@ -503,6 +624,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("logs", nargs="*",
                     help="dmesg / logcat / audit.log files (default: stdin). "
                          "Use '-' for stdin explicitly.")
+    ap.add_argument("--no-permissive-triage", action="store_true",
+                    help="Suppress the permissive-triage section (silent "
+                         "permissive-only accesses split by neverallow status). "
+                         "Triage runs automatically when --rom-root is given.")
     ap.add_argument("--rom-root", type=Path, default=None,
                     help="Root of an extracted ROM (system/fs_tree/, "
                          "vendor/fs_tree/, system_ext/fs_tree/). When given, "
@@ -595,6 +720,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         emit(by_domain, pol, args.cil, args.keep_cats,
              dontaudit_enabled, len(denials), n_total=n_total,
              dfilter=dfilter, out=out_stream)
+        if args.rom_root is not None and not args.no_permissive_triage:
+            permissive_triage(by_domain, args.rom_root, out=out_stream)
     finally:
         if fh:
             fh.close()

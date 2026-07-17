@@ -1,5 +1,5 @@
 #!/bin/bash
-
+import ROM_ROOT
 findRoot() {
 	local dir=$(pwd)
 
@@ -14,7 +14,11 @@ findRoot() {
 	return 1
 }
 
-ROM_ROOT=$(findRoot)
+[[ ! -d "super" ]] && { \
+	ROM_ROOT=$(findRoot)
+	export ROM_ROOT
+} || \
+	ROM_ROOT=super/lp_images
 
 secilc -M true -G -N -c 30 "$ROM_ROOT/system/fs_tree/system/etc/selinux/plat_sepolicy.cil" "$ROM_ROOT/system_ext/fs_tree/etc/selinux/system_ext_sepolicy.cil" "$ROM_ROOT/vendor/fs_tree/etc/selinux/vendor_sepolicy.cil" "$ROM_ROOT/vendor/fs_tree/etc/selinux/plat_pub_versioned.cil" -o /tmp/check.bin || \
 
