@@ -26,10 +26,19 @@ only exists because a domain ran permissive) — the rule is still emitted,
 just flagged, exactly like SEPwalk annotates its suggestions.
 
 --domain narrows a run to denials touching a given type in EITHER the
-source or the target context.  It is repeatable and accepts globs:
+source or the target context.  It takes one or more values, is repeatable,
+accepts globs, and swallows a pasted SELinux brace set so a group copied
+out of a .te file needs no reformatting:
 
     SEPreap dmesg.txt --domain attestmon --rom-root ./rom
-    SEPreap dmesg.txt --domain 'hal_*' --domain vold
+    SEPreap dmesg.txt --domain 'hal_*' vold
+    SEPreap dmesg.txt --domain { attestmon 'hal_*' vold }
+
+Because --domain is variadic, place any log-file positionals before it or
+feed logs on stdin; otherwise argparse assigns trailing filenames to the
+pattern list.  --domain-file / --domain-src-file / --domain-tgt-file read
+patterns from a file (brace sets and '#' comments tolerated) for lists too
+long to paste.
 
 Use --domain-src / --domain-tgt when you specifically want to pin the
 side.  ('self' rules are matched on their source, since that IS the
@@ -322,6 +331,57 @@ class DomainFilter:
         if self.tgt:
             bits.append("tgt=" + ",".join(self.tgt))
         return "  ".join(bits)
+
+
+# ----------------------------------------------------------------------------
+# Multi-domain input helpers
+#
+# Domain patterns are accepted as SELinux-style sets so a brace group copied
+# out of a .te file pastes through unchanged.  Braces (standalone tokens or
+# glued to a name), commas, and surrounding whitespace are delimiters; empty
+# fragments are discarded.  A single pasted argument may itself carry internal
+# whitespace and braces, e.g. '{ attestmon vold }'.
+# ----------------------------------------------------------------------------
+_BRACE_DELIMS = str.maketrans("{},", "   ")
+
+
+def _split_brace_tokens(raw: str) -> List[str]:
+    return raw.translate(_BRACE_DELIMS).split()
+
+
+class ExtendDomains(argparse.Action):
+    """Flatten one or more domain patterns into a single list.
+
+    Repeated occurrences accumulate, multi-value invocations flatten, and
+    brace/comma set syntax is normalized away.  All of the following yield
+    the same three patterns:
+
+        --domain attestmon vold hal_foo
+        --domain { attestmon vold hal_foo }
+        --domain '{ attestmon vold hal_foo }'
+        --domain attestmon --domain vold --domain hal_foo
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = list(getattr(namespace, self.dest, None) or [])
+        for raw in values:
+            current.extend(_split_brace_tokens(raw))
+        setattr(namespace, self.dest, current)
+
+
+def read_domain_file(path: str) -> List[str]:
+    """Read domain patterns from a file: whitespace/newline separated, with
+    brace/comma set syntax and '#' line comments both tolerated."""
+    p = Path(path)
+    if not p.is_file():
+        print(f"SEPreap: error: cannot read domain file: {path}",
+              file=sys.stderr)
+        raise SystemExit(2)
+    out: List[str] = []
+    for line in p.read_text(errors="replace").splitlines():
+        line = line.split("#", 1)[0]
+        out.extend(_split_brace_tokens(line))
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -638,17 +698,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("-D", "--dontaudit-rules", metavar="FILE", default=None,
                     help="Extra noise rules appended to the built-in table "
                          "(one 'ttype/tclass:perm' per line). Implies -d.")
-    ap.add_argument("--domain", action="append", metavar="TYPE", default=[],
+    ap.add_argument("--domain", nargs="+", action=ExtendDomains,
+                    metavar="TYPE", default=[],
                     help="Only reap denials where TYPE appears in EITHER the "
-                         "source or target context. Repeatable; accepts globs "
-                         "(e.g. --domain 'hal_*'). A 'self' target counts as "
-                         "its source type.")
-    ap.add_argument("--domain-src", action="append", metavar="TYPE", default=[],
+                         "source or target context. Takes one or more values, "
+                         "repeatable, glob-aware, and accepts a pasted brace "
+                         "set: --domain { attestmon 'hal_*' vold }. A 'self' "
+                         "target counts as its source type.")
+    ap.add_argument("--domain-src", nargs="+", action=ExtendDomains,
+                    metavar="TYPE", default=[],
                     help="Like --domain but pinned to the source (subject) "
-                         "context only. Repeatable; accepts globs.")
-    ap.add_argument("--domain-tgt", action="append", metavar="TYPE", default=[],
+                         "context only. Same multi-value / brace-set syntax.")
+    ap.add_argument("--domain-tgt", nargs="+", action=ExtendDomains,
+                    metavar="TYPE", default=[],
                     help="Like --domain but pinned to the target (object) "
-                         "context only. Repeatable; accepts globs.")
+                         "context only. Same multi-value / brace-set syntax.")
+    ap.add_argument("--domain-file", metavar="FILE", default=None,
+                    help="Read EITHER-side patterns from FILE (whitespace or "
+                         "newline separated; brace sets and '#' comments "
+                         "tolerated). Merged with any --domain values.")
+    ap.add_argument("--domain-src-file", metavar="FILE", default=None,
+                    help="Like --domain-file, pinned to the source context.")
+    ap.add_argument("--domain-tgt-file", metavar="FILE", default=None,
+                    help="Like --domain-file, pinned to the target context.")
     ap.add_argument("--cil", action="store_true",
                     help="Also emit a CIL form of each rule beneath the .te "
                          "line (for direct secilc / SEPclean workflows).")
@@ -687,6 +759,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             text = text + "\n" + f.read_text(errors="replace")
         noise = NoiseTable(text)
+
+    if args.domain_file:
+        args.domain += read_domain_file(args.domain_file)
+    if args.domain_src_file:
+        args.domain_src += read_domain_file(args.domain_src_file)
+    if args.domain_tgt_file:
+        args.domain_tgt += read_domain_file(args.domain_tgt_file)
 
     dfilter = DomainFilter(args.domain, args.domain_src, args.domain_tgt)
 
