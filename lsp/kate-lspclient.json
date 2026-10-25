@@ -1,0 +1,10 @@
+{
+    "servers": {
+        "te": {
+            "command": ["python3", "/path/to/sepolicy-lsp/sepolicy_lsp.py", "--cil", "/path/to/plat_sepolicy.cil"],
+            "rootIndicationFileNames": ["*.te"],
+            "languages": ["te"],
+            "highlightingModeRegex": "^(SELinux TE|SELinux|TE Policy|te)$"
+        }
+    }
+}

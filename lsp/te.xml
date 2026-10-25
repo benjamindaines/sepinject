@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE language SYSTEM "language.dtd">
+<!--
+  KSyntaxHighlighting definition for Android SELinux .te policy files.
+  Install into ~/.local/share/org.kde.syntax-highlighting/syntax/ (create if absent), then assign the
+  "SELinux TE" mode to a .te file. The LSP client's highlightingModeRegex matches this name so the server
+  attaches automatically.
+-->
+<language name="SELinux TE" section="Other" version="1" kateversion="5.0"
+          extensions="*.te" mimetype="text/x-selinux-te" author="sepolicy-lsp" license="MIT">
+  <highlighting>
+    <list name="rules">
+      <item>allow</item>
+      <item>auditallow</item>
+      <item>dontaudit</item>
+      <item>neverallow</item>
+      <item>allowxperm</item>
+      <item>auditallowxperm</item>
+      <item>dontauditxperm</item>
+      <item>neverallowxperm</item>
+    </list>
+    <list name="declarations">
+      <item>type</item>
+      <item>attribute</item>
+      <item>typeattribute</item>
+      <item>type_transition</item>
+      <item>type_member</item>
+      <item>type_change</item>
+      <item>permissive</item>
+      <item>genfscon</item>
+      <item>mlstrustedsubject</item>
+      <item>mlstrustedobject</item>
+      <item>expandattribute</item>
+      <item>attribute_role</item>
+      <item>roletype</item>
+    </list>
+    <list name="removals">
+      <item>remove_allow</item>
+      <item>remove_auditallow</item>
+      <item>remove_dontaudit</item>
+      <item>remove_type</item>
+      <item>remove_genfscon</item>
+      <item>remove_permissive</item>
+      <item>remove_typeattribute</item>
+      <item>remove_mlstrustedsubject</item>
+      <item>remove_mlstrustedobject</item>
+    </list>
+    <list name="macros">
+      <item>init_daemon_domain</item>
+      <item>domain_auto_trans</item>
+      <item>domain_trans</item>
+      <item>set_prop</item>
+      <item>get_prop</item>
+      <item>binder_use</item>
+      <item>binder_call</item>
+      <item>binder_service</item>
+      <item>unix_socket_connect</item>
+    </list>
+    <contexts>
+      <context name="Normal" attribute="Normal Text" lineEndContext="#stay">
+        <DetectChar attribute="Comment" context="Comment" char="#"/>
+        <keyword attribute="Rule Keyword" context="#stay" String="rules"/>
+        <keyword attribute="Declaration Keyword" context="#stay" String="declarations"/>
+        <keyword attribute="Removal Keyword" context="#stay" String="removals"/>
+        <keyword attribute="Macro" context="#stay" String="macros"/>
+        <DetectChar attribute="Class Separator" context="#stay" char=":"/>
+        <RegExpr attribute="Permission Set" context="#stay" String="self\b"/>
+      </context>
+      <context name="Comment" attribute="Comment" lineEndContext="#pop"/>
+    </contexts>
+    <itemDatas>
+      <itemData name="Normal Text" defStyleNum="dsNormal"/>
+      <itemData name="Rule Keyword" defStyleNum="dsKeyword" bold="1"/>
+      <itemData name="Declaration Keyword" defStyleNum="dsKeyword"/>
+      <itemData name="Removal Keyword" defStyleNum="dsControlFlow" bold="1"/>
+      <itemData name="Macro" defStyleNum="dsFunction"/>
+      <itemData name="Class Separator" defStyleNum="dsOperator"/>
+      <itemData name="Permission Set" defStyleNum="dsBuiltIn"/>
+      <itemData name="Comment" defStyleNum="dsComment"/>
+    </itemDatas>
+  </highlighting>
+  <general>
+    <comments>
+      <comment name="singleLine" start="#"/>
+    </comments>
+    <keywords casesensitive="1"/>
+  </general>
+</language>
